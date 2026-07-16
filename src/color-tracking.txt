@@ -1,0 +1,202 @@
+import cyberpi, mbuild
+import time
+
+# ================== CONFIGURACION ==================
+# EM1 = dirección (solo pulsos cortos)
+# EM2 = tracción (nunca se detiene durante la carrera)
+
+VELOCIDAD_AVANCE      = 32
+VELOCIDAD_CURVA       = 38
+POTENCIA_GIRO         = 40
+TIEMPO_PULSO_GIRO     = 0.14
+TIEMPO_RECENTRADO     = 0.12
+TIEMPO_CURVA_MAX      = 1.8
+TIEMPO_ENTRE_GIROS    = 0.9
+
+LECTURAS_COLOR        = 2
+LECTURAS_MINIMAS      = 2
+TIEMPO_ENTRE_LECTURAS = 0.003
+
+# AI Camera 2.0 - IDs entrenados y valores LAB (tolerancia +-2)
+# NARANJA: ID=3, L53 A19 B24
+# AZUL:    ID=1, L31 A5  B-18
+# BLANCO:  ID=2, L68 A0  B0
+ID_NARANJA = 3
+ID_AZUL    = 1
+ID_BLANCO  = 2
+
+ESQUINAS_POR_VUELTA = 4
+VUELTAS_OBJETIVO    = 3
+
+# Solo usa el 30% inferior de la cámara (más cerca del suelo)
+ALTO_IMAGEN  = 240
+UMBRAL_Y_MIN = 168
+
+TIEMPO_ENTRE_DEBUG = 0.4
+
+# ================== ESTADO GLOBAL ==================
+
+esquinas_completadas = 0
+vueltas_completadas  = 0
+ultimo_giro_t        = 0
+ultimo_debug_t       = 0
+sentido_pista        = 1
+senal_entrada        = ID_NARANJA
+senal_salida         = ID_AZUL
+
+# ================== FUNCIONES AUXILIARES ==================
+
+def camara_ve(color_id):
+    if mbuild.ai_camera.ai_camera_color_number_get(color_id, 1) == 0:
+        return False
+    y = mbuild.ai_camera.ai_camera_color_spatial_attribute_get(2, color_id, 1)
+    return y >= UMBRAL_Y_MIN
+
+
+def avanzar(em1=0, velocidad=None):
+    if velocidad is None:
+        velocidad = VELOCIDAD_AVANCE
+    cyberpi.mbot2.drive_power(em1, velocidad)
+
+
+def llantas_rectas():
+    avanzar(0, VELOCIDAD_AVANCE)
+
+
+def detectar_color(color_id):
+    aciertos = 0
+    for _ in range(LECTURAS_COLOR):
+        if camara_ve(color_id):
+            aciertos += 1
+        time.sleep(TIEMPO_ENTRE_LECTURAS)
+    return aciertos >= LECTURAS_MINIMAS
+
+
+def en_cooldown():
+    return (time.time() - ultimo_giro_t) < TIEMPO_ENTRE_GIROS
+
+
+def direccion_curva():
+    """A horario -> DERECHA (1), B antihorario -> IZQUIERDA (-1)."""
+    return 1 if sentido_pista == 1 else -1
+
+
+# ================== GIRO EN ESQUINA ==================
+
+def tomar_curva():
+    """
+    Horario:     naranja -> DERECHA -> azul -> blanco -> rectas
+    Antihorario: azul -> IZQUIERDA -> naranja -> blanco -> rectas
+    """
+    global ultimo_giro_t, esquinas_completadas
+
+    potencia = POTENCIA_GIRO * direccion_curva()
+
+    # 1. Pulso corto para fijar ángulo de las ruedas
+    avanzar(potencia, VELOCIDAD_CURVA)
+    time.sleep(TIEMPO_PULSO_GIRO)
+    avanzar(0, VELOCIDAD_CURVA)
+
+    inicio = time.time()
+    vio_segunda = False
+    vio_blanco = False
+
+    # 2. Mantener giro hasta la segunda línea de color
+    while (time.time() - inicio) < TIEMPO_CURVA_MAX:
+        avanzar(0, VELOCIDAD_CURVA)
+        if camara_ve(senal_salida):
+            vio_segunda = True
+            break
+        time.sleep(0.02)
+
+    # 3. Después de la segunda línea: esperar blanco para confirmar salida
+    if vio_segunda:
+        while (time.time() - inicio) < TIEMPO_CURVA_MAX:
+            avanzar(0, VELOCIDAD_CURVA)
+            if camara_ve(ID_BLANCO) and not camara_ve(senal_salida):
+                vio_blanco = True
+                break
+            time.sleep(0.02)
+
+    # 4. Pulso inverso para enderezar las ruedas
+    avanzar(-potencia, VELOCIDAD_CURVA)
+    time.sleep(TIEMPO_RECENTRADO)
+    llantas_rectas()
+
+    ultimo_giro_t = time.time()
+    esquinas_completadas += 1
+
+    estado = "OK" if vio_blanco else ("2L" if vio_segunda else "TO")
+    cyberpi.console.println("C" + str(esquinas_completadas) + " " + estado)
+
+
+# ================== DEBUG ==================
+
+def mostrar_debug():
+    global ultimo_debug_t
+    if (time.time() - ultimo_debug_t) < TIEMPO_ENTRE_DEBUG:
+        return
+    ultimo_debug_t = time.time()
+
+    if camara_ve(ID_NARANJA):
+        cyberpi.led.on(255, 140, 0)
+        cyberpi.console.println("NAR")
+    elif camara_ve(ID_AZUL):
+        cyberpi.led.on(0, 100, 255)
+        cyberpi.console.println("AZU")
+    elif camara_ve(ID_BLANCO):
+        cyberpi.led.on(0, 255, 0)
+        cyberpi.console.println("BLA")
+    else:
+        cyberpi.led.on(255, 255, 255)
+
+
+# ================== INICIO ==================
+
+def esperar_sentido():
+    cyberpi.display.clear()
+    cyberpi.console.println("A: horario")
+    cyberpi.console.println("B: antihorario")
+    while True:
+        cyberpi.led.on(255, 165, 0)
+        if cyberpi.controller.is_press('a'):
+            cyberpi.console.println("-> horario")
+            return 1
+        if cyberpi.controller.is_press('b'):
+            cyberpi.console.println("-> antihorario")
+            return -1
+        time.sleep(0.05)
+
+sentido_pista = esperar_sentido()
+
+if sentido_pista == 1:
+    senal_entrada = ID_NARANJA
+    senal_salida  = ID_AZUL
+else:
+    senal_entrada = ID_AZUL
+    senal_salida  = ID_NARANJA
+
+cyberpi.display.clear()
+cyberpi.led.on(0, 255, 0)
+cyberpi.console.println("EN MARCHA")
+ultimo_giro_t = time.time() - TIEMPO_ENTRE_GIROS
+llantas_rectas()
+
+# ================== BUCLE PRINCIPAL ==================
+
+while vueltas_completadas < VUELTAS_OBJETIVO:
+    mostrar_debug()
+
+    if not en_cooldown() and detectar_color(senal_entrada):
+        tomar_curva()
+
+    llantas_rectas()
+    vueltas_completadas = esquinas_completadas // ESQUINAS_POR_VUELTA
+    time.sleep(0.02)
+
+# ================== FIN ==================
+
+cyberpi.mbot2.EM_stop(port="all")
+cyberpi.led.on(0, 0, 255)
+cyberpi.console.println("3 vueltas OK")
+cyberpi.console.println("Fin Ronda 1")
